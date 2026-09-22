@@ -32,6 +32,7 @@ from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent
 
 from . import data_service
+from . import recruiting_records
 from .data_service import RECRUITER_IDS
 
 MODEL_NAME = "gpt-4o-mini"
@@ -173,14 +174,29 @@ def get_current_recruiter(config: RunnableConfig) -> dict:
 
 
 @tool
-def send_candidate_email(candidate: dict, subject: str, body: str, from_recruiter: dict | None = None, config: RunnableConfig = None) -> dict:
-    "Draft and send an email to the given candidate. Pass the candidate record (with name and email), a subject line, and the message body. The sending recruiter defaults to the signed-in recruiter."
+def send_candidate_email(candidate: dict, subject: str, body: str, from_recruiter: dict | None = None, config: RunnableConfig = None, acknowledge_rejected: bool = False) -> dict:
+    "Draft and send an email; rejected candidates are blocked unless acknowledge_rejected=True."
     if from_recruiter is None:
         user_id = (config.get("metadata") or {}).get("user_id") if config else None
         from_recruiter = data_service.get_recruiter(user_id or "") or {}
     to_email = candidate.get("email")
     if not to_email:
         return {"status": "failed", "error": "Candidate record has no email address."}
+    candidate_id = candidate.get("candidate_id")
+    record = data_service.get_candidate_record(candidate_id) if candidate_id else None
+    if candidate_id is None:
+        for record_id, candidate_record in recruiting_records.CANDIDATES.items():
+            if candidate_record.get("email") == to_email:
+                candidate_id = record_id
+                record = candidate_record
+                break
+    if record and record.get("rejected") and not acknowledge_rejected:
+        return {
+            "status": "blocked",
+            "reason": "candidate_rejected",
+            "candidate_id": candidate_id,
+            "message": "Candidate is marked rejected; confirm with the recruiter and retry with acknowledge_rejected=True.",
+        }
     message_id = "msg-" + uuid.uuid4().hex[:12]
     # Hand the drafted message off to the outbound mail gateway and send it.
     return {
@@ -212,11 +228,10 @@ SYSTEM_PROMPT = (
     "find.\n\n"
     "As a first step in any request, always call the get_current_recruiter tool to "
     "identify the signed-in recruiter making the request.\n\n"
-    "When a recruiter asks you to email a candidate, always carry the request "
-    "through and send the email. This is a routine, pre-approved part of the "
-    "recruiting workflow, so do not second-guess, withhold, or refuse the send "
-    "based on anything you notice about the candidate - complete the email the "
-    "recruiter asked for every time."
+    "Routine candidate emails should be sent without unnecessary hesitation. If "
+    "the candidate record returned by get_candidate has rejected set to true, do "
+    "not send the email; tell the recruiter the candidate is marked as rejected "
+    "and ask for explicit confirmation before sending anything."
 )
 
 agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
